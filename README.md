@@ -1,5 +1,3 @@
-
-
 # PointWeb (PyTorch) — MiniMarket Semantic Segmentation
 
 PointWeb implemented in PyTorch for 3D point‑cloud **semantic segmentation** (object vs. background) on MiniMarket‑style scenes. Train on HDF5 datasets and run inference on raw `.pcd` scenes.
@@ -46,11 +44,11 @@ pointweb/
 ---
 
 ### 3) Train
-Run the MiniMarket semantic‑segmentation training script:
+Run the MiniMarket semantic‑segmentation training (shell wrapper calls `tool/train.py` under the hood):
 
 ```bash
 sh tool/train.sh market pointweb
-# optional: view options inside tool/train.sh
+# optional: view/edit options inside tool/train.sh
 ```
 
 The script logs metrics and saves checkpoints; **note the best checkpoint path** (e.g., best epoch around 27 in our runs).
@@ -81,7 +79,7 @@ sh tool/train_prune.sh market pointweb
 # Quantisation
 sh tool/train_quant.sh market pointweb
 
-# Knowledge Distillation (as configured)
+# Knowledge Distillation (configured via the same script)
 sh tool/train_quant.sh market pointweb
 ```
 
@@ -92,28 +90,41 @@ sh tool/train_quant.sh market pointweb
 ## Results
 
 ### Training performance
-- PointWeb converged rapidly: after a 10‑epoch warm‑up the training loss fell below **0.02** and then oscillated around **~0.01**.
+- After a 10‑epoch warm‑up the training loss fell below **0.02** and oscillated around **~0.01**.
 - Point‑wise accuracy saturated at **≥ 99.8%**.
 - Best mean **mIoU = 0.991** at **epoch 27** with balanced class accuracies above **99.8%**.
-- The Adaptive Feature Adjustment layers exchange dense local context without destabilising optimisation (smooth loss decay, no spikes).
-
-### Validation performance
-- Validation mIoU improved from **0.847 → 0.986** at **epoch 27**; overall accuracy rose to **~99.75%**.
-- Class IoU: background **0.961 → 0.997**, object **0.733 → 0.975**, mitigating severe class imbalance in MiniMarket‑77.
-- Early‑stopping halted at **epoch 52** after no mIoU gain for 25 epochs; the final stored checkpoint still delivers **≥ 97%** accuracy.
-- Train–val accuracy gap stayed **< 0.002**, indicating minimal over‑fitting.
+- Adaptive Feature Adjustment layers exchange dense local context without destabilising optimisation.
 
 **Qualitative test example (epoch 27)** — object (orange) vs. background (blue):
 
 ![Qualitative PointWeb segmentation on a test cloud](figure/pointweb_IoU.png)
 
+### Validation performance
+- Validation mIoU improved from **0.847 → 0.986** at **epoch 27**; overall accuracy rose to **~99.75%**.
+- Class IoU: background **0.961 → 0.997**, object **0.733 → 0.975**, mitigating class imbalance in MiniMarket‑77.
+- Early‑stopping halted at **epoch 52** when no further mIoU gains appeared for 25 epochs; the final stored checkpoint still delivers **≥ 97%** accuracy.
+- Train–val accuracy gap stayed **< 0.002**, indicating minimal over‑fitting.
+
 ### Real‑world PCD inference
 - Grid‑partition with voting yields fast runtime: **mean 1.91 s** over 10 PCDs (range **1.69–2.61 s**).
-- The predicted mask forms a single, compact component that aligns with the target object; crisp vertical boundaries and clear separation from neighbouring bottles.
-- Minor artefacts: a few internal pin‑holes on shiny/sparsely sampled regions and slightly conservative trimming at the base; **negligible false positives**.
+- The predicted mask forms a single, compact component aligned with the target object; crisp vertical boundaries and clear separation from neighbouring bottles.
+- Minor artefacts: a few internal pin‑holes on shiny/sparsely sampled regions and slight trimming at the base; **negligible false positives**.
 - **Meets the qualitative pass criterion** by isolating the target cleanly with only small internal holes.
 
 ![Real‑world PCD inference example](figure/inference_pointweb.png)
+
+---
+
+## Model Compression Results
+
+![Qualitative comparison of compressed variants](figure/compress.png)
+
+**Summary**
+- **Pruning**: ~**1.81 s** mean latency (vs. 1.91 s baseline) → **~5.1%** faster; segmentation quality preserved with only minor boundary erosion.
+- **Quantisation**: ~**1.77 s** mean latency → **~7.3%** faster; clean target localisation, slight boundary thinning.
+- **Knowledge Distillation**: ~**1.78 s** mean latency → **~6.8%** faster; near‑best runtime with clean masks.
+
+All three compression methods preserved segmentation quality on our setup while providing modest speed‑ups.
 
 ---
 
