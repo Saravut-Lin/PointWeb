@@ -20,4 +20,7 @@ then
 elif [ ${dataset} = 'scannet' ]
 then
   $PYTHON tool/test_scannet.py --config=${config} 2>&1 | tee ${model_dir}/test-$now.log
+elif [ ${dataset} = 'market' ]
+then
+  $PYTHON tool/test_market.py --config=${config} 2>&1 | tee ${model_dir}/test-$now.log
 fi

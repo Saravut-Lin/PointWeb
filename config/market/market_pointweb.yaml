@@ -1,0 +1,61 @@
+##############################################
+# config/market_jam_hartleys_strawberry/
+#   market_jam_hartleys_strawberry_pointweb.yaml
+##############################################
+
+DATA:
+  data_name: market
+  data_root: dataset/market77/jam_hartleys_strawberry_300gm_1200_2048_segmentation_20480_12000
+  classes: 2
+  fea_dim: 3  # RGB (3)
+  num_point: 20480 # Default: 20480
+  # The fields below are only placeholders (S3DIS expects them, but our HDF5 loader ignores them):
+  block_size: 0.0
+  stride_rate: 0.0
+  sample_rate: 1.0 # Default: 1.0
+
+TRAIN:
+  arch: pointweb_seg
+  use_xyz: True
+  sync_bn: False
+  ignore_label: 255
+  train_gpu: [0]
+  train_workers: 4 # Default: 4
+  train_batch_size: 5            # try 1 or 2, depending on GPU RAM
+  train_batch_size_val: 2
+  base_lr: 0.01 # Default: 0.05
+  epochs: 100 # Default: 50
+  start_epoch: 0
+  step_epoch: 10 # Default: 30
+  multiplier: 0.1
+  momentum: 0.9
+  weight_decay: 0.0005
+  manual_seed: 123
+  print_freq: 10 # Default: 10
+  save_freq: 5 # Default: 1
+  save_path: exp/market/pointweb/optim_distil/model
+  # per-class loss weights (inverse-frequency)
+  weight: [0.55555556, 5.0]
+  #class_weight: [0.55555556, 5.0]
+  resume:
+  evaluate: True # Default: True
+  early_stop_warmup: 10
+  early_stop_patience: 25
+
+
+TEST:
+  #test_list: ''
+  #test_list_full: ''
+  #split: test
+  #test_gpu: [0]
+  #test_workers: 0 # Default: 2
+  #test_batch_size: 1
+  arch: pointweb_seg
+  classes: 2
+  ignore_label: 255
+  print_freq: 1
+  num_workers: 0
+  batch_size: 1
+  model_path: exp/market/pointweb/optim_distil/model/best_model.pth
+  save_folder: exp/market/pointweb/optim_distil/results/
+  #names_path: ''

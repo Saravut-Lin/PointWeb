@@ -19,4 +19,7 @@ elif [ ${dataset} = 'scannet' ]
 then
   cp tool/test.sh tool/test_scannet.py ${config} ${exp_dir}
   $PYTHON tool/test_scannet.py --config=${config} 2>&1 | tee ${model_dir}/test-$now.log
+elif [ ${dataset} = 'market' ]
+then
+  $PYTHON tool/test_market.py --config=${config} 2>&1 | tee ${model_dir}/test-$now.log
 fi

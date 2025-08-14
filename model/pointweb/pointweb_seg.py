@@ -6,6 +6,8 @@ import torch.nn as nn
 from model.pointweb.pointweb_module import PointWebSAModule
 from model.pointnet2.pointnet2_modules import PointNet2FPModule
 from util import pt_util
+import torch.nn.utils.prune as prune
+import torch.quantization as quantization
 
 
 class PointWebSeg(nn.Module):
@@ -64,6 +66,55 @@ class PointWebSeg(nn.Module):
             l_features[i - 1] = self.FP_modules[i](l_xyz[i - 1], l_xyz[i], l_features[i - 1], l_features[i])
         return self.FC_layer(l_features[0].unsqueeze(-1)).squeeze(-1)
 
+    def apply_unstructured_pruning(self, amount=0.2):
+        """Apply L1 unstructured pruning to all Conv2d layers."""
+        for module in self.modules():
+            if isinstance(module, nn.Conv2d):
+                prune.l1_unstructured(module, name='weight', amount=amount)
+
+    def apply_structured_pruning(self, amount=0.2, n=1, dim=0):
+        """Apply structured pruning (filter/channel) to Conv2d layers."""
+        for module in self.modules():
+            if isinstance(module, nn.Conv2d):
+                prune.ln_structured(module, name='weight', amount=amount, n=n, dim=dim)
+
+    def remove_pruning(self):
+        """Remove pruning reparameterizations to finalize weights."""
+        for module in self.modules():
+            if isinstance(module, nn.Conv2d):
+                try:
+                    prune.remove(module, 'weight')
+                except (ValueError, AttributeError):
+                    pass
+
+    def fuse_model(self):
+        """Fuse modules for static quantization."""
+        # Fuse convolution, batchnorm, and activation in pt_util.Conv2d wrappers
+        for module in self.modules():
+            if isinstance(module, pt_util.Conv2d):
+                quantization.fuse_modules(module, ['0', '1', '2'], inplace=True)
+
+    def prepare_qat(self, backend='fbgemm'):
+        """Prepare the model for Quantization Aware Training (QAT)."""
+        self.qconfig = quantization.get_default_qat_qconfig(backend)
+        quantization.prepare_qat(self, inplace=True)
+
+    def convert_quantized(self):
+        """Convert a prepared or trained QAT model to a quantized version."""
+        quantization.convert(self, inplace=True)
+
+    @torch.no_grad()
+    def apply_post_training_quantization(self, calibration_loader, backend='fbgemm'):
+        """Apply static post-training quantization using a calibration data loader."""
+        self.eval()
+        self.qconfig = quantization.get_default_qconfig(backend)
+        quantization.prepare(self, inplace=True)
+        # Calibration pass
+        for inputs, _ in calibration_loader:
+            inputs = inputs.cuda(non_blocking=True)
+            self(inputs)
+        quantization.convert(self, inplace=True)
+
 
 def model_fn_decorator(criterion):
     ModelReturn = namedtuple("ModelReturn", ['preds', 'loss', 'acc'])
@@ -71,8 +122,10 @@ def model_fn_decorator(criterion):
     def model_fn(model, data, epoch=0, eval=False):
         with torch.set_grad_enabled(not eval):
             inputs, labels = data
-            inputs = inputs.cuda(async=True)
-            labels = labels.cuda(async=True)
+            #inputs = inputs.cuda(async=True)
+            #labels = labels.cuda(async=True)
+            inputs = inputs.cuda(non_blocking=True)
+            labels = labels.cuda(non_blocking=True)
             preds = model(inputs)
             loss = criterion(preds, labels)
             _, classes = torch.max(preds, 1)
@@ -87,8 +140,10 @@ def model_fn_decorator(criterion):
     def model_fn(model, data, eval=False):
         with torch.set_grad_enabled(not eval):
             inputs, labels = data
-            inputs = inputs.cuda(async=True)
-            labels = labels.cuda(async=True)
+            #inputs = inputs.cuda(async=True)
+            #labels = labels.cuda(async=True)
+            inputs = inputs.cuda(non_blocking=True)
+            labels = labels.cuda(non_blocking=True)
             preds = model(inputs)
             loss = criterion(preds, labels)
             _, classes = torch.max(preds, 1)

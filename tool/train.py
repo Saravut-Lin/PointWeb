@@ -1,4 +1,5 @@
 import os
+import matplotlib.pyplot as plt
 import time
 import random
 import numpy as np
@@ -13,10 +14,13 @@ import torch.optim
 import torch.utils.data
 import torch.optim.lr_scheduler as lr_scheduler
 from tensorboardX import SummaryWriter
+# Add advanced LR schedulers
+from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts, CyclicLR
 
 from util import dataset, transform, config
 from util.s3dis import S3DIS
 from util.scannet import ScanNet
+from util.market import MarketJamSegDataset # Add Market77 Dataset
 from util.util import AverageMeter, intersectionAndUnionGPU
 
 
@@ -40,6 +44,12 @@ def get_logger():
     fmt = "[%(asctime)s %(levelname)s %(filename)s line %(lineno)d %(process)d] %(message)s"
     handler.setFormatter(logging.Formatter(fmt))
     logger.addHandler(handler)
+    # also log to file in the save_path directory
+    if hasattr(args, 'save_path'):
+        log_file = os.path.join(args.save_path, 'train.log')
+        fh = logging.FileHandler(log_file)
+        fh.setFormatter(logging.Formatter(fmt))
+        logger.addHandler(fh)
     return logger
 
 
@@ -67,6 +77,12 @@ def init():
 
 def main():
     init()
+    # lists to store metrics per epoch
+    train_loss_list = []
+    val_loss_list = []
+    train_acc_list = []
+    val_acc_list = []
+    # Model selection
     if args.arch == 'pointnet_seg':
         from model.pointnet.pointnet import PointNetSeg as Model
     elif args.arch == 'pointnet2_seg':
@@ -74,81 +90,186 @@ def main():
     elif args.arch == 'pointweb_seg':
         from model.pointweb.pointweb_seg import PointWebSeg as Model
     else:
-        raise Exception('architecture not supported yet'.format(args.arch))
+        raise Exception(f'architecture not supported: {args.arch}')
+
     model = Model(c=args.fea_dim, k=args.classes, use_xyz=args.use_xyz)
     if args.sync_bn:
         from util.util import convert_to_syncbn
         convert_to_syncbn(model)
-    criterion = nn.CrossEntropyLoss(ignore_index=args.ignore_label).cuda()
-    optimizer = torch.optim.SGD(model.parameters(), lr=args.base_lr, momentum=args.momentum, weight_decay=args.weight_decay)
-    scheduler = lr_scheduler.StepLR(optimizer, step_size=args.step_epoch, gamma=args.multiplier)
-    logger.info("=> creating model ...")
-    logger.info("Classes: {}".format(args.classes))
-    logger.info(model)
     model = torch.nn.DataParallel(model.cuda())
-    if args.sync_bn:
-        from lib.sync_bn import patch_replication_callback
-        patch_replication_callback(model)
-    if args.weight:
+
+    # Criterion with optional class weights
+    weight = None
+    if isinstance(args.weight, (list, tuple)):
+        weight = torch.tensor(args.weight, device='cuda')
+    criterion = nn.CrossEntropyLoss(weight=weight, ignore_index=args.ignore_label).cuda()
+
+    optimizer = torch.optim.SGD(model.parameters(), lr=args.base_lr,
+                                momentum=args.momentum, weight_decay=args.weight_decay)
+    #scheduler = lr_scheduler.StepLR(optimizer, step_size=args.step_epoch, gamma=args.multiplier)
+    # Option A: Cosine Annealing with Warm Restarts
+    scheduler = CosineAnnealingWarmRestarts(
+        optimizer,
+        T_0=args.step_epoch,    # first cycle length (in epochs)
+        T_mult=2,               # cycle length multiplier
+        eta_min=1e-5            # minimum learning rate
+    )
+    # Option B (alternative): Cyclical LR (uncomment if preferred)
+    # scheduler = CyclicLR(
+    #     optimizer,
+    #     base_lr=1e-5,
+    #     max_lr=args.base_lr,
+    #     step_size_up=len(train_loader)*args.step_epoch,
+    #     mode='triangular2',
+    #     cycle_momentum=False
+    # )
+
+    # Load pretrained checkpoint if provided as string
+    if isinstance(args.weight, str) and args.weight:
         if os.path.isfile(args.weight):
-            logger.info("=> loading weight '{}'".format(args.weight))
-            checkpoint = torch.load(args.weight)
-            model.load_state_dict(checkpoint['state_dict'])
-            logger.info("=> loaded weight '{}'".format(args.weight))
+            logger.info(f"=> loading checkpoint '{args.weight}'")
+            ckpt = torch.load(args.weight, map_location='cuda')
+            model.load_state_dict(ckpt['state_dict'])
+            logger.info(f"=> loaded checkpoint '{args.weight}'")
         else:
-            logger.info("=> no weight found at '{}'".format(args.weight))
+            logger.warning(f"No checkpoint found at '{args.weight}', training from scratch.")
 
-    if args.resume:
-        if os.path.isfile(args.resume):
-            logger.info("=> loading checkpoint '{}'".format(args.resume))
-            # checkpoint = torch.load(args.resume)
-            checkpoint = torch.load(args.resume, map_location=lambda storage, loc: storage.cuda())
-            args.start_epoch = checkpoint['epoch']
-            model.load_state_dict(checkpoint['state_dict'])
-            optimizer.load_state_dict(checkpoint['optimizer'])
-            scheduler.load_state_dict(checkpoint['scheduler'])
-            logger.info("=> loaded checkpoint '{}' (epoch {})".format(args.resume, checkpoint['epoch']))
-        else:
-            logger.info("=> no checkpoint found at '{}'".format(args.resume))
+    # Resume training state
+    if args.resume and os.path.isfile(args.resume):
+        logger.info(f"=> loading resume checkpoint '{args.resume}'")
+        ckpt = torch.load(args.resume, map_location='cuda')
+        args.start_epoch = ckpt['epoch']
+        model.load_state_dict(ckpt['state_dict'])
+        optimizer.load_state_dict(ckpt['optimizer'])
+        scheduler.load_state_dict(ckpt['scheduler'])
+        logger.info(f"=> resumed from '{args.resume}' (epoch {args.start_epoch})")
 
+    # Data transforms and datasets
     train_transform = transform.Compose([transform.ToTensor()])
-    if args.data_name == 's3dis':
-        train_data = S3DIS(split='train', data_root=args.train_full_folder, num_point=args.num_point, test_area=args.test_area, block_size=args.block_size, sample_rate=args.sample_rate, transform=train_transform)
-        # train_data = dataset.PointData(split='train', data_root=args.data_root, data_list=args.train_list, transform=train_transform)
+    if args.data_name == 'market':
+        train_data = MarketJamSegDataset(h5_path=args.data_root,
+                                         split='train',
+                                         transform=None)
+    elif args.data_name == 's3dis':
+        train_data = S3DIS(split='train', data_root=args.train_full_folder,
+                           num_point=args.num_point, test_area=args.test_area,
+                           block_size=args.block_size, sample_rate=args.sample_rate,
+                           transform=train_transform)
     elif args.data_name == 'scannet':
-        train_data = ScanNet(split='train', data_root=args.data_root, num_point=args.num_point, block_size=args.block_size, sample_rate=args.sample_rate, transform=train_transform)
-    elif args.data_name == 'modelnet40':
-        train_data = dataset.PointData(split='train', data_root=args.data_root, data_list=args.train_list, transform=train_transform, num_point=args.num_point, random_index=True)
-    train_loader = torch.utils.data.DataLoader(train_data, batch_size=args.train_batch_size, shuffle=True, num_workers=args.train_workers, pin_memory=True)
+        train_data = ScanNet(split='train', data_root=args.data_root,
+                              num_point=args.num_point, block_size=args.block_size,
+                              sample_rate=args.sample_rate, transform=train_transform)
+    else:
+        raise Exception(f"Unsupported data_name: {args.data_name}")
+
+    train_loader = torch.utils.data.DataLoader(train_data,
+                                               batch_size=args.train_batch_size,
+                                               shuffle=True,
+                                               num_workers=args.train_workers,
+                                               pin_memory=True,
+                                               worker_init_fn=worker_init_fn)
 
     val_loader = None
     if args.evaluate:
         val_transform = transform.Compose([transform.ToTensor()])
-        val_data = dataset.PointData(split='val', data_root=args.data_root, data_list=args.val_list, transform=val_transform)
-        val_loader = torch.utils.data.DataLoader(val_data, batch_size=args.train_batch_size_val, shuffle=False, num_workers=args.train_workers, pin_memory=True)
+        if args.data_name == 'market':
+            val_data = MarketJamSegDataset(h5_path=args.data_root,
+                                           split='test', transform=val_transform)
+        else:
+            # fallback
+            val_data = dataset.PointData(split='val', data_root=args.data_root,
+                                         data_list=args.val_list, transform=val_transform)
+        val_loader = torch.utils.data.DataLoader(val_data,
+                                                 batch_size=args.train_batch_size_val,
+                                                 shuffle=False,
+                                                 num_workers=args.train_workers,
+                                                 pin_memory=True)
+
+    # Early stopping & warm-up
+    best_mIoU = 0.0
+    no_improve = 0
+    best_epoch = 0
+    warmup_epochs = getattr(args, 'early_stop_warmup', 20)
 
     for epoch in range(args.start_epoch, args.epochs):
         scheduler.step()
-        loss_train, mIoU_train, mAcc_train, allAcc_train = train(train_loader, model, criterion, optimizer, epoch)
-        epoch_log = epoch + 1
-        writer.add_scalar('loss_train', loss_train, epoch_log)
-        writer.add_scalar('mIoU_train', mIoU_train, epoch_log)
-        writer.add_scalar('mAcc_train', mAcc_train, epoch_log)
-        writer.add_scalar('allAcc_train', allAcc_train, epoch_log)
 
-        if epoch_log % args.save_freq == 0:
-            filename = args.save_path + '/train_epoch_' + str(epoch_log) + '.pth'
-            logger.info('Saving checkpoint to: ' + filename)
-            torch.save({'epoch': epoch_log, 'state_dict': model.state_dict(), 'optimizer': optimizer.state_dict(), 'scheduler': scheduler.state_dict()}, filename)
-            if epoch_log / args.save_freq > 2:
-                deletename = args.save_path + '/train_epoch_' + str(epoch_log - args.save_freq * 2) + '.pth'
-                os.remove(deletename)
-        if args.evaluate:
-            loss_val, mIoU_val, mAcc_val, allAcc_val = validate(val_loader, model, criterion)
-            writer.add_scalar('loss_val', loss_val, epoch_log)
-            writer.add_scalar('mIoU_val', mIoU_val, epoch_log)
-            writer.add_scalar('mAcc_val', mAcc_val, epoch_log)
-            writer.add_scalar('allAcc_val', allAcc_val, epoch_log)
+        # Train + log
+        loss_train, mIoU_train, mAcc_train, allAcc_train = train(
+            train_loader, model, criterion, optimizer, epoch)
+        writer.add_scalar('loss_train', loss_train, epoch+1)
+        writer.add_scalar('mIoU_train', mIoU_train, epoch+1)
+
+        # record training metrics
+        train_loss_list.append(loss_train)
+        train_acc_list.append(allAcc_train)
+
+
+        # --- SAVE EVERY EPOCH AFTER WARM-UP ---
+        if epoch + 1 > warmup_epochs:
+            ckpt_path = os.path.join(
+                args.save_path, f'train_epoch_{epoch+1}.pth')
+            logger.info(f"Saving checkpoint (post-warmup): {ckpt_path}")
+            torch.save({
+                'epoch':      epoch+1,
+                'state_dict': model.state_dict(),
+                'optimizer':  optimizer.state_dict(),
+                'scheduler':  scheduler.state_dict(),
+            }, ckpt_path)
+        else:
+            logger.info(f"[Warm-up] Epoch {epoch+1}/{warmup_epochs} (no save)")
+
+        # Validate + early-stop
+        if args.evaluate and val_loader is not None:
+            loss_val, mIoU_val, mAcc_val, allAcc_val = validate(
+                val_loader, model, criterion)
+            writer.add_scalar('loss_val', loss_val, epoch+1)
+            writer.add_scalar('mIoU_val', mIoU_val, epoch+1)
+
+            # record validation metrics
+            val_loss_list.append(loss_val)
+            val_acc_list.append(allAcc_val)
+
+            if epoch + 1 > warmup_epochs:
+                if mIoU_val > best_mIoU:
+                    best_mIoU = mIoU_val
+                    best_epoch = epoch+1
+                    no_improve = 0
+                    best_path = os.path.join(args.save_path, 'best_model.pth')
+                    torch.save(model.state_dict(), best_path)
+                    logger.info(f"New best mIoU: {best_mIoU:.4f}, saved to {best_path}")
+                else:
+                    no_improve += 1
+                    logger.info(f"No improvement for {no_improve} epochs post-warmup")
+                if no_improve >= args.early_stop_patience:
+                    logger.info(f"Early stopping at epoch {epoch+1}")
+                    break
+            else:
+                # still warming up
+                no_improve = 0
+                logger.info(f"[Warm-up] Skipping early-stop check at epoch {epoch+1}")
+
+    logger.info(f"Training complete. Best validation mIoU {best_mIoU:.4f} achieved at epoch {best_epoch}.")
+    writer.close()
+
+    # plot and save loss & accuracy curves
+    epochs = list(range(1, len(train_loss_list) + 1))
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(8, 10))
+    ax1.plot(epochs, train_loss_list, label='Train Loss')
+    ax1.plot(epochs, val_loss_list, label='Val Loss')
+    ax1.set_title('Loss per Epoch')
+    ax1.set_xlabel('Epoch')
+    ax1.set_ylabel('Loss')
+    ax1.legend()
+    ax2.plot(epochs, train_acc_list, label='Train Acc')
+    ax2.plot(epochs, val_acc_list, label='Val Acc')
+    ax2.set_title('Accuracy per Epoch')
+    ax2.set_xlabel('Epoch')
+    ax2.set_ylabel('Accuracy')
+    ax2.legend()
+    metrics_path = os.path.join(args.save_path, 'metrics.png')
+    plt.tight_layout()
+    plt.savefig(metrics_path)
 
 
 def train(train_loader, model, criterion, optimizer, epoch):
