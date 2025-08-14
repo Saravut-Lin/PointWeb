@@ -36,7 +36,7 @@ Place the generated file here:
 pointweb/
 └─ dataset/
    └─ market77/
-      └─ market_semseg.h5   # ← your generated file (name is up to you)
+      └─ jam_hartleys_strawberry_300gm_1200_2048_segmentation_20480_12000   # ← your generated file (name is up to you)
 ```
 
 > If you use a different path/filename, adjust the corresponding argument or constant in the training/inference scripts.
@@ -59,9 +59,7 @@ The script logs metrics and saves checkpoints; **note the best checkpoint path**
 Use your saved checkpoint to run inference on a PCD file. Example PCDs live under **`segmentation/realworld_scene/`**.
 
 ```bash
-python segmentation/inference.py \
-  --ckpt checkpoints/<your_best_checkpoint>.pth \
-  --pcd segmentation/realworld_scene/scene_01.pcd
+python segmentation/inference.py
 # optional: `python segmentation/inference.py -h` for flags
 ```
 
