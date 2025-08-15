@@ -147,7 +147,7 @@ pointweb/
 ---
 
 ## Tips & Troubleshooting
-- **CUDA / memory:** reduce batch size or neighborhood size `k` if you hit OOM.
+- **CUDA / memory:** reduce batch size `k` if you hit OOM.
 - **PCD ingest:** ensure `.pcd` files are valid; the inference script removes invalid points but cannot fix corrupted files.
 - **Paths:** double‑check dataset and checkpoint paths and CLI arguments.
 - **Scripts:** Review the shell scripts in `tool/` to adjust epochs, LR, and other hyper‑parameters.
